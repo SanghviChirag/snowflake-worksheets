@@ -1,145 +1,66 @@
 import snowflake.snowpark as snowpark
-from snowflake.snowpark.functions import col, count, when, expr
+from snowflake.snowpark.functions import col, count, when
 
 
 def main(session: snowpark.Session):
     input_tables = [
-        "<db>.<schema>.<tbl>",
+        "DEV_PRISM.RAW_CHIRAG_DATA_MODELS.FACT_ORDER_ITEM",
+        # Add more tables here if needed
     ]
 
     result_rows = []
 
-    # DATE format pattern
-    date_regex = (
-        "("
-        "^\\d{4}[-/]\\d{2}[-/]\\d{2}$|"
-        "^\\d{2}[-/]\\d{2}[-/]\\d{4}$|"
-        "^20\\d{2}(0[1-9]|1[0-2])(0[1-9]|[12][0-9]|3[01])$"
-        ")"
-    )
-
-    # DATETIME / TIMESTAMP format pattern
-    datetime_regex = "(" "^\\d{4}[-/]\\d{2}[-/]\\d{2}[ T]\\d{2}:\\d{2}(:\\d{2})?$" ")"
-
     for full_table_name in input_tables:
         database, schema, table = full_table_name.split(".")
 
+        # Step 1: Get VARCHAR-like columns with "date" in the name
         columns_info = session.sql(
             f"""
             SELECT column_name, data_type
             FROM {database}.information_schema.columns
             WHERE table_schema = '{schema}'
               AND table_name = '{table}'
+              AND data_type IN ('VARCHAR', 'TEXT', 'STRING', 'CHAR')
+              AND column_name ILIKE '%date%'
         """
         ).collect()
 
-        candidate_columns = [
-            {"name": row["COLUMN_NAME"], "datatype": row["DATA_TYPE"]}
-            for row in columns_info
-            if row["DATA_TYPE"].upper() in ("TEXT", "VARCHAR", "STRING", "CHAR")
+        if not columns_info:
+            continue
+
+        date_like_columns = [row["COLUMN_NAME"] for row in columns_info]
+        col_exprs = [
+            count(when(col(c).is_not_null(), c)).alias(c) for c in date_like_columns
         ]
 
-        date_named_columns = [
-            col for col in candidate_columns if "DATE" in col["name"].upper()
-        ]
+        # Step 2: Count non-null values for each date-named column
+        df = session.table(full_table_name).agg(*col_exprs)
+        df_result = df.collect()[0].as_dict()
 
-        flagged = set()
-
-        if candidate_columns:
-            # Expressions to detect DATE
-            date_exprs = [
-                count(
-                    when(
-                        expr(
-                            f"LENGTH({col['name']}) BETWEEN 8 AND 10 AND "
-                            f"regexp_like({col['name']}, '{date_regex}') AND "
-                            f"TRY_TO_DATE({col['name']}) IS NOT NULL"
-                        ),
-                        col["name"],
-                    )
-                ).alias(f"date_{col['name']}")
-                for col in candidate_columns
-            ]
-
-            # Expressions to detect DATETIME
-            datetime_exprs = [
-                count(
-                    when(
-                        expr(
-                            f"regexp_like({col['name']}, '{datetime_regex}') AND "
-                            f"TRY_TO_TIMESTAMP({col['name']}) IS NOT NULL"
-                        ),
-                        col["name"],
-                    )
-                ).alias(f"datetime_{col['name']}")
-                for col in candidate_columns
-            ]
-
-            # Combine both
-            df = session.table(full_table_name).agg(*(date_exprs + datetime_exprs))
-            df_result = df.collect()[0].as_dict()
-
-            for col in candidate_columns:
-                date_count = df_result.get(f"date_{col['name']}", 0)
-                dt_count = df_result.get(f"datetime_{col['name']}", 0)
-
-                if dt_count > 0:
-                    result_rows.append(
-                        (
-                            database,
-                            schema,
-                            table,
-                            col["name"],
-                            col["datatype"],
-                            "TIMESTAMP",
-                        )
-                    )
-                    flagged.add(col["name"])
-
-                elif date_count > 0:
-                    result_rows.append(
-                        (database, schema, table, col["name"], col["datatype"], "DATE")
-                    )
-                    flagged.add(col["name"])
-
-        # Fields with "date" in name that weren’t flagged yet
-        for col in date_named_columns:
-            if col["name"] not in flagged:
+        for col_name in date_like_columns:
+            if df_result.get(col_name, 0) == 0:
+                col_info = next(c for c in columns_info if c["COLUMN_NAME"] == col_name)
                 result_rows.append(
                     (
                         database,
                         schema,
                         table,
-                        col["name"],
-                        col["datatype"],
-                        "DATE (by name)",
+                        col_name,
+                        col_info["DATA_TYPE"],
+                        "empty date field",
                     )
                 )
 
-    # Final output
+    # Final result dataframe
     if result_rows:
         result_df = session.create_dataframe(
             result_rows,
-            schema=[
-                "database",
-                "schema",
-                "table",
-                "field",
-                "datatype",
-                "suggested_datatype",
-            ],
+            schema=["database", "schema", "table", "column", "datatype", "reason"],
         )
     else:
         result_df = session.create_dataframe(
             [(None, None, None, None, None, None)],
-            schema=[
-                "database",
-                "schema",
-                "table",
-                "field",
-                "datatype",
-                "suggested_datatype",
-            ],
+            schema=["database", "schema", "table", "column", "datatype", "reason"],
         )
 
     result_df.show()
