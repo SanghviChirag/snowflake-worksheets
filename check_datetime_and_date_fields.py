@@ -4,8 +4,7 @@ from snowflake.snowpark.functions import col, count, when
 
 def main(session: snowpark.Session):
     input_tables = [
-        "DEV_PRISM.RAW_CHIRAG_DATA_MODELS.FACT_ORDER_ITEM",
-        # Add more tables here if needed
+        "<db>.<schema>.<table>",
     ]
 
     result_rows = []
